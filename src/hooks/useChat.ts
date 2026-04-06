@@ -786,12 +786,39 @@ export function useChat(
         tools: FILE_TOOLS,
       };
 
-      const response = await fetch(API_URL, {
+      let response = await fetch(API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
         signal: controller.signal,
       });
+
+      // If API fails and we have image content, retry without images
+      if (!response.ok) {
+        const hasImages = apiMessages.some((m: Record<string, unknown>) =>
+          Array.isArray(m.content) && (m.content as unknown[]).some((c: unknown) => (c as Record<string, unknown>).type === "image_url")
+        );
+        if (hasImages) {
+          console.warn("API failed with image content, retrying without images...");
+          // Strip image content from messages — keep only text
+          const cleanedMessages = apiMessages.map((m: Record<string, unknown>) => {
+            if (Array.isArray(m.content)) {
+              const textParts = (m.content as Record<string, unknown>[])
+                .filter((c) => c.type === "text")
+                .map((c) => c.text as string);
+              return { ...m, content: textParts.join("\n") + "\n[Note: An image was attached but the model doesn't support vision. Describe what you need verbally.]" };
+            }
+            return m;
+          });
+          const retryBody = { ...body, messages: cleanedMessages };
+          response = await fetch(API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(retryBody),
+            signal: controller.signal,
+          });
+        }
+      }
 
       if (!response.ok) {
         throw new Error(`API error: ${response.status} ${response.statusText}`);

@@ -4,7 +4,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 interface OpenAIMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
+  content: string | null | Array<{ type: string; text?: string; image_url?: { url: string; detail?: string } }>;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
   name?: string;
@@ -2654,6 +2654,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const allTools = [...TASK_AGENT_TOOLS, ...(body.tools || [])];
       const customToolNames = new Set((body.tools || []).map((t: any) => (t.function || t).name));
 
+      // Detect if any message contains image content (vision request)
+      const hasImageContent = body.messages.some((m: any) => {
+        if (Array.isArray(m.content)) {
+          return m.content.some((c: any) => c.type === "image_url");
+        }
+        return false;
+      });
+      // Use a vision-capable model when images are present
+      // kilo-auto/free tries to route to minimax which is dead, so force a working vision model
+      const kiloModel = hasImageContent ? "google/gemini-2.5-flash-preview:free" : KILO_DEFAULT_MODEL;
+      if (hasImageContent) {
+        log.info(`Vision content detected — using model: ${kiloModel}`);
+      }
+
       // Send initial role chunk
       res.write(sseChunk(id, model, { role: "assistant", content: "" }));
 
@@ -2671,7 +2685,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             Authorization: `Bearer ${KILO_API_KEY}`,
           },
           body: JSON.stringify({
-            model: KILO_DEFAULT_MODEL,
+            model: kiloModel,
             messages: kiloMessages,
             max_tokens: maxTokens,
             temperature,
