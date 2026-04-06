@@ -91,6 +91,57 @@ function getToolAccentColor(name: string): string {
 }
 
 /* ─── Tool Call Card ─────────────────────────────────────────────────── */
+/* ─── Tool Result Display ─────────────────────────────────────────────
+ * Renders tool results — shows screenshot image + layout analysis
+ * for screenshot results, or plain text for other tools.
+ * ──────────────────────────────────────────────────────────────────── */
+function ToolResultDisplay({ result, isError }: { result: string; isError: boolean }) {
+  if (result.startsWith("data:image/")) {
+    const splitIdx = result.indexOf("\n\n");
+    const imgSrc = splitIdx > 0 ? result.slice(0, splitIdx) : result;
+    const layoutText = splitIdx > 0 ? result.slice(splitIdx + 2) : null;
+    return (
+      <div className="mt-1 rounded-lg overflow-hidden" style={{ border: "1px solid hsl(220 13% 17%)" }}>
+        <img
+          src={imgSrc}
+          alt="Preview screenshot"
+          className="w-full h-auto"
+          style={{ maxHeight: 400, objectFit: "contain", background: "#fff" }}
+        />
+        <div
+          className="px-2 py-1 text-center font-sans"
+          style={{ background: "hsl(220 13% 10%)", color: "hsl(142 71% 55%)", fontSize: "0.6rem" }}
+        >
+          Screenshot captured + DOM layout analyzed
+        </div>
+        {layoutText && (
+          <pre
+            className="p-2 overflow-x-auto max-h-32 overflow-y-auto"
+            style={{ background: "hsl(220 13% 8%)", fontSize: "0.58rem", lineHeight: "1.5", color: "hsl(220 14% 50%)" }}
+          >
+            {layoutText.length > 2000 ? layoutText.slice(0, 2000) + "\n..." : layoutText}
+          </pre>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <pre
+      className="mt-1 p-2.5 rounded-lg overflow-x-auto max-h-52 overflow-y-auto"
+      style={{
+        background: "hsl(220 13% 10%)",
+        fontSize: "0.68rem",
+        lineHeight: "1.6",
+        border: "1px solid hsl(220 13% 17%)",
+        color: isError ? "hsl(0 84% 65%)" : "hsl(220 14% 68%)",
+      }}
+    >
+      {result.length > 3000 ? result.slice(0, 3000) + "\n... (truncated)" : result}
+    </pre>
+  );
+}
+
 function ToolCallCard({ toolCall }: { toolCall: ToolCallInfo }) {
   const [expanded, setExpanded] = useState(false);
 
@@ -220,52 +271,7 @@ function ToolCallCard({ toolCall }: { toolCall: ToolCallInfo }) {
               >
                 Result
               </span>
-              {/* Show screenshot image + layout analysis */}
-              {toolCall.result.startsWith("data:image/") ? (() => {
-                const splitIdx = toolCall.result.indexOf("\n\n");
-                const imgSrc = splitIdx > 0 ? toolCall.result.slice(0, splitIdx) : toolCall.result;
-                const layoutText = splitIdx > 0 ? toolCall.result.slice(splitIdx + 2) : null;
-                return (
-                  <div className="mt-1 rounded-lg overflow-hidden" style={{ border: "1px solid hsl(220 13% 17%)" }}>
-                    <img
-                      src={imgSrc}
-                      alt="Preview screenshot"
-                      className="w-full h-auto"
-                      style={{ maxHeight: 400, objectFit: "contain", background: "#fff" }}
-                    />
-                    <div
-                      className="px-2 py-1 text-center font-sans"
-                      style={{ background: "hsl(220 13% 10%)", color: "hsl(142 71% 55%)", fontSize: "0.6rem" }}
-                    >
-                      Screenshot captured + DOM layout analyzed — AI can understand the UI
-                    </div>
-                    {layoutText && (
-                      <pre
-                        className="p-2 overflow-x-auto max-h-32 overflow-y-auto"
-                        style={{ background: "hsl(220 13% 8%)", fontSize: "0.58rem", lineHeight: "1.5", color: "hsl(220 14% 50%)" }}
-                      >
-                        {layoutText.length > 2000 ? layoutText.slice(0, 2000) + "\n..." : layoutText}
-                      </pre>
-                    )}
-                  </div>
-                );
-              })()
-              ) : (
-                <pre
-                  className="mt-1 p-2.5 rounded-lg overflow-x-auto max-h-52 overflow-y-auto"
-                  style={{
-                    background: "hsl(220 13% 10%)",
-                    fontSize: "0.68rem",
-                    lineHeight: "1.6",
-                    border: "1px solid hsl(220 13% 17%)",
-                    color: isError ? "hsl(0 84% 65%)" : "hsl(220 14% 68%)",
-                  }}
-                >
-                  {toolCall.result.length > 3000
-                    ? toolCall.result.slice(0, 3000) + "\n... (truncated)"
-                    : toolCall.result}
-                </pre>
-              )}
+              <ToolResultDisplay result={toolCall.result} isError={isError} />
             </div>
           )}
         </div>
