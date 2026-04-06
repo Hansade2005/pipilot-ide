@@ -432,7 +432,7 @@ export function IDELayout() {
               }}
               data-testid="chat-panel-wrapper"
             >
-              <ChatPanel toolExecutor={toolExecutorWithCheckpoints} workspaceContext={workspaceContext} checkpointManager={checkpointManagerForChat} projectId={activeProjectId} />
+              <ChatPanel toolExecutor={toolExecutorWithCheckpoints} workspaceContext={workspaceContext} checkpointManager={checkpointManagerForChat} projectId={activeProjectId} fileTree={files} />
             </div>
           </>
         )}

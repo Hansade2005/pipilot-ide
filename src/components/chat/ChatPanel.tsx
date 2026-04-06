@@ -25,6 +25,89 @@ import {
 } from "lucide-react";
 import { useChat, ChatMode, ToolExecutor, WorkspaceContext, CheckpointManager } from "@/hooks/useChat";
 import { ChatMessageItem } from "./ChatMessage";
+import { FileNode } from "@/hooks/useFileSystem";
+import { At, FolderOpen, FileCode2, AlertTriangle } from "lucide-react";
+
+/* ─── @ File Attachment System ───────────────────────────────────────── */
+const MAX_ATTACH_LINES = 500;
+const MAX_ATTACH_CHARS = 30000;
+const TRUNCATION_WARN = "⚠️ File truncated to fit context limit.";
+
+interface FileAttachment {
+  id: string;        // file path
+  name: string;
+  type: "file" | "folder";
+  language?: string;
+  lineCount: number;
+  charCount: number;
+  truncated: boolean;
+  content: string;   // the actual content (possibly truncated)
+}
+
+/** Flatten a FileNode tree into a flat list of {id, name, type, language, content} */
+function flattenTree(nodes: FileNode[], prefix = ""): { id: string; name: string; type: "file" | "folder"; language?: string; content?: string }[] {
+  const result: { id: string; name: string; type: "file" | "folder"; language?: string; content?: string }[] = [];
+  for (const node of nodes) {
+    result.push({ id: node.id, name: node.name, type: node.type, language: node.language, content: node.content });
+    if (node.children) result.push(...flattenTree(node.children, node.id + "/"));
+  }
+  return result;
+}
+
+/** Smart truncation: keeps first N lines, respects char limit, adds warning */
+function smartTruncate(content: string, maxLines: number, maxChars: number): { text: string; truncated: boolean; lineCount: number } {
+  const lines = content.split("\n");
+  const lineCount = lines.length;
+
+  if (lineCount <= maxLines && content.length <= maxChars) {
+    return { text: content, truncated: false, lineCount };
+  }
+
+  // Truncate by lines first
+  let truncLines = lines.slice(0, maxLines);
+  let text = truncLines.join("\n");
+
+  // Then by chars if still too long
+  if (text.length > maxChars) {
+    text = text.slice(0, maxChars);
+    // Cut at last newline to avoid mid-line truncation
+    const lastNl = text.lastIndexOf("\n");
+    if (lastNl > maxChars * 0.7) text = text.slice(0, lastNl);
+  }
+
+  const shownLines = text.split("\n").length;
+  text += `\n\n${TRUNCATION_WARN} Showing ${shownLines} of ${lineCount} lines.`;
+  return { text, truncated: true, lineCount };
+}
+
+/** Fuzzy match: check if query chars appear in order in target */
+function fuzzyMatch(target: string, query: string): { matches: boolean; score: number } {
+  const tLower = target.toLowerCase();
+  const qLower = query.toLowerCase();
+
+  // Exact substring match gets highest score
+  if (tLower.includes(qLower)) return { matches: true, score: 100 + (qLower.length / tLower.length) * 50 };
+
+  // Fuzzy: chars must appear in order
+  let qi = 0;
+  let consecutiveBonus = 0;
+  let lastIdx = -2;
+  for (let ti = 0; ti < tLower.length && qi < qLower.length; ti++) {
+    if (tLower[ti] === qLower[qi]) {
+      if (ti === lastIdx + 1) consecutiveBonus += 10;
+      lastIdx = ti;
+      qi++;
+    }
+  }
+  if (qi === qLower.length) {
+    const baseScore = (qLower.length / tLower.length) * 40 + consecutiveBonus;
+    // Bonus for matching at word boundaries (after / or .)
+    const nameStart = tLower.lastIndexOf("/") + 1;
+    if (tLower.slice(nameStart).startsWith(qLower[0])) return { matches: true, score: baseScore + 20 };
+    return { matches: true, score: baseScore };
+  }
+  return { matches: false, score: 0 };
+}
 
 /* ─── Slash Commands ─────────────────────────────────────────────────── */
 interface SlashCommand {
@@ -75,9 +158,10 @@ interface ChatPanelProps {
   workspaceContext?: WorkspaceContext;
   checkpointManager?: CheckpointManager;
   projectId?: string;
+  fileTree?: FileNode[];
 }
 
-export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, projectId }: ChatPanelProps) {
+export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, projectId, fileTree }: ChatPanelProps) {
   const {
     messages,
     isStreaming,
@@ -117,6 +201,106 @@ export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, p
   const [showScrollDown, setShowScrollDown] = useState(false);
   const [charCount, setCharCount] = useState(0);
 
+  // @ File attachment state
+  const [showAtMenu, setShowAtMenu] = useState(false);
+  const [atFilter, setAtFilter] = useState("");
+  const [atIndex, setAtIndex] = useState(0);
+  const [attachments, setAttachments] = useState<FileAttachment[]>([]);
+  const [atCursorStart, setAtCursorStart] = useState(-1); // position of the @ in input
+
+  // Flat file list for @ autocomplete
+  const flatFiles = useMemo(() => {
+    if (!fileTree) return [];
+    return flattenTree(fileTree);
+  }, [fileTree]);
+
+  // @ autocomplete filtered results
+  const filteredAtFiles = useMemo(() => {
+    if (!atFilter && !showAtMenu) return [];
+    const query = atFilter.toLowerCase();
+    const allFiles = flatFiles;
+
+    if (!query) {
+      // Show all files (folders first, then files), limited to 12
+      return [...allFiles]
+        .sort((a, b) => {
+          if (a.type !== b.type) return a.type === "folder" ? -1 : 1;
+          return a.id.localeCompare(b.id);
+        })
+        .slice(0, 12);
+    }
+
+    // Fuzzy search and rank
+    return allFiles
+      .map((f) => ({ ...f, ...fuzzyMatch(f.id, query) }))
+      .filter((f) => f.matches)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 10);
+  }, [flatFiles, atFilter, showAtMenu]);
+
+  // Attach a file
+  const attachFile = useCallback((fileId: string) => {
+    // Don't double-attach
+    if (attachments.some((a) => a.id === fileId)) return;
+
+    const file = flatFiles.find((f) => f.id === fileId);
+    if (!file) return;
+
+    if (file.type === "folder") {
+      // Attach folder: include list of children as context
+      const children = flatFiles.filter((f) => f.id.startsWith(fileId + "/") || f.id === fileId);
+      const fileList = children.filter((f) => f.type === "file").map((f) => f.id).join("\n");
+      const folderContent = `[Folder: ${fileId}]\nContains ${children.filter(f => f.type === "file").length} files:\n${fileList}`;
+      setAttachments((prev) => [...prev, {
+        id: fileId,
+        name: file.name,
+        type: "folder",
+        lineCount: children.filter(f => f.type === "file").length,
+        charCount: folderContent.length,
+        truncated: false,
+        content: folderContent,
+      }]);
+    } else {
+      // Attach file with smart truncation
+      const raw = file.content ?? "";
+      const { text, truncated, lineCount } = smartTruncate(raw, MAX_ATTACH_LINES, MAX_ATTACH_CHARS);
+      setAttachments((prev) => [...prev, {
+        id: fileId,
+        name: file.name,
+        type: "file",
+        language: file.language,
+        lineCount,
+        charCount: raw.length,
+        truncated,
+        content: text,
+      }]);
+    }
+  }, [flatFiles, attachments]);
+
+  // Remove an attachment
+  const removeAttachment = useCallback((fileId: string) => {
+    setAttachments((prev) => prev.filter((a) => a.id !== fileId));
+  }, []);
+
+  // Handle @ autocomplete selection
+  const handleAtSelect = useCallback((fileId: string) => {
+    attachFile(fileId);
+    setShowAtMenu(false);
+    setAtFilter("");
+    // Remove the @query from input
+    if (atCursorStart >= 0) {
+      const before = input.slice(0, atCursorStart);
+      // Find the end of the @mention (next space or end)
+      const afterAt = input.slice(atCursorStart);
+      const spaceIdx = afterAt.indexOf(" ");
+      const after = spaceIdx >= 0 ? afterAt.slice(spaceIdx) : "";
+      const newInput = before + after;
+      setInput(newInput);
+      setCharCount(newInput.length);
+    }
+    textareaRef.current?.focus();
+  }, [attachFile, atCursorStart, input]);
+
   // Randomize suggestion set on mount
   const suggestions = useMemo(
     () => SUGGESTION_SETS[Math.floor(Math.random() * SUGGESTION_SETS.length)],
@@ -155,11 +339,28 @@ export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, p
 
   const handleSend = () => {
     const trimmed = input.trim();
-    if (!trimmed || isStreaming) return;
-    sendMessage(trimmed);
+    if (!trimmed && attachments.length === 0) return;
+    if (isStreaming) return;
+
+    // Build the final message with attached file context
+    let finalMessage = trimmed;
+    if (attachments.length > 0) {
+      const contextBlocks = attachments.map((a) => {
+        if (a.type === "folder") {
+          return `--- Attached folder: ${a.id} ---\n${a.content}`;
+        }
+        const header = `--- Attached file: ${a.id} (${a.lineCount} lines, ${a.language || "plaintext"})${a.truncated ? " [TRUNCATED]" : ""} ---`;
+        return `${header}\n${a.content}`;
+      });
+      finalMessage = `${contextBlocks.join("\n\n")}\n\n---\n\n${trimmed}`;
+    }
+
+    sendMessage(finalMessage);
     setInput("");
     setCharCount(0);
+    setAttachments([]);
     setShowSlashMenu(false);
+    setShowAtMenu(false);
     if (textareaRef.current) textareaRef.current.style.height = "auto";
   };
 
@@ -181,6 +382,31 @@ export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, p
   );
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // @ menu navigation
+    if (showAtMenu && filteredAtFiles.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setAtIndex((i) => Math.min(i + 1, filteredAtFiles.length - 1));
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setAtIndex((i) => Math.max(i - 1, 0));
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        if (filteredAtFiles[atIndex]) {
+          handleAtSelect(filteredAtFiles[atIndex].id);
+        }
+        return;
+      }
+      if (e.key === "Escape") {
+        setShowAtMenu(false);
+        return;
+      }
+    }
+
     // Slash menu navigation
     if (showSlashMenu) {
       if (e.key === "ArrowDown") {
@@ -214,22 +440,49 @@ export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, p
 
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
+    const cursorPos = e.target.selectionStart ?? value.length;
     setInput(value);
     setCharCount(value.length);
     e.target.style.height = "auto";
     e.target.style.height = Math.min(e.target.scrollHeight, 160) + "px";
 
-    // Slash command detection
+    // Slash command detection (only at start of input)
     if (value === "/") {
       setShowSlashMenu(true);
       setSlashFilter("");
       setSlashIndex(0);
+      setShowAtMenu(false);
     } else if (value.startsWith("/") && !value.includes(" ")) {
       setShowSlashMenu(true);
       setSlashFilter(value.slice(1));
       setSlashIndex(0);
+      setShowAtMenu(false);
     } else {
       setShowSlashMenu(false);
+    }
+
+    // @ mention detection: find the last @ before cursor that isn't preceded by a space-less word
+    const textBeforeCursor = value.slice(0, cursorPos);
+    const lastAtIdx = textBeforeCursor.lastIndexOf("@");
+    if (lastAtIdx >= 0) {
+      // The @ must be at start or preceded by whitespace
+      const charBefore = lastAtIdx > 0 ? value[lastAtIdx - 1] : " ";
+      if (charBefore === " " || charBefore === "\n" || lastAtIdx === 0) {
+        const afterAt = textBeforeCursor.slice(lastAtIdx + 1);
+        // Only show menu if there's no space yet (still typing the mention)
+        if (!afterAt.includes(" ") && !afterAt.includes("\n")) {
+          setShowAtMenu(true);
+          setAtFilter(afterAt);
+          setAtIndex(0);
+          setAtCursorStart(lastAtIdx);
+        } else {
+          setShowAtMenu(false);
+        }
+      } else {
+        setShowAtMenu(false);
+      }
+    } else {
+      setShowAtMenu(false);
     }
   };
 
@@ -517,6 +770,76 @@ export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, p
         </div>
       )}
 
+      {/* ── @ File mention popup ── */}
+      {showAtMenu && filteredAtFiles.length > 0 && (
+        <div
+          className="mx-3 mb-1 rounded-xl border overflow-hidden"
+          style={{
+            background: "hsl(220 13% 17%)",
+            borderColor: "hsl(220 13% 25%)",
+            boxShadow: "0 -8px 32px hsl(220 13% 5% / 0.5)",
+            maxHeight: 280,
+            overflowY: "auto",
+          }}
+        >
+          <div
+            className="px-3 py-1.5 text-xs font-medium flex items-center gap-1.5"
+            style={{ color: "hsl(220 14% 42%)", borderBottom: "1px solid hsl(220 13% 22%)" }}
+          >
+            <At size={10} />
+            <span>Attach file or folder</span>
+            {atFilter && (
+              <span className="ml-auto font-mono" style={{ color: "hsl(207 90% 60%)", fontSize: "0.65rem" }}>
+                {filteredAtFiles.length} match{filteredAtFiles.length !== 1 ? "es" : ""}
+              </span>
+            )}
+          </div>
+          {filteredAtFiles.map((file, idx) => {
+            const isFolder = file.type === "folder";
+            const alreadyAttached = attachments.some((a) => a.id === file.id);
+            const lines = file.content ? file.content.split("\n").length : 0;
+            const isOverLimit = lines > MAX_ATTACH_LINES;
+            return (
+              <button
+                key={file.id}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-all duration-100 text-left"
+                style={{
+                  background: idx === atIndex ? "hsl(207 90% 40% / 0.12)" : "transparent",
+                  color: alreadyAttached ? "hsl(220 14% 40%)" : idx === atIndex ? "hsl(220 14% 88%)" : "hsl(220 14% 70%)",
+                  borderLeft: idx === atIndex ? "2px solid hsl(207 90% 55%)" : "2px solid transparent",
+                  opacity: alreadyAttached ? 0.5 : 1,
+                }}
+                onMouseEnter={() => setAtIndex(idx)}
+                onClick={() => !alreadyAttached && handleAtSelect(file.id)}
+                disabled={alreadyAttached}
+              >
+                <span style={{ color: isFolder ? "hsl(38 92% 55%)" : "hsl(207 90% 60%)", flexShrink: 0 }}>
+                  {isFolder ? <FolderOpen size={12} /> : <FileCode2 size={12} />}
+                </span>
+                <span className="font-mono truncate flex-1" style={{ fontSize: "0.7rem" }}>
+                  {file.id}
+                </span>
+                {!isFolder && lines > 0 && (
+                  <span
+                    className="flex-shrink-0 flex items-center gap-0.5 tabular-nums"
+                    style={{
+                      fontSize: "0.6rem",
+                      color: isOverLimit ? "hsl(38 92% 55%)" : "hsl(220 14% 40%)",
+                    }}
+                  >
+                    {isOverLimit && <AlertTriangle size={8} />}
+                    {lines}L
+                  </span>
+                )}
+                {alreadyAttached && (
+                  <span className="flex-shrink-0 text-xs" style={{ color: "hsl(142 71% 50%)", fontSize: "0.6rem" }}>attached</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       {/* ── Slash command popup ── */}
       {showSlashMenu && filteredSlashCommands.length > 0 && (
         <div
@@ -572,6 +895,52 @@ export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, p
               : "0 2px 8px hsl(220 13% 5% / 0.3), inset 0 1px 0 hsl(220 13% 22%)",
           }}
         >
+
+          {/* Attachment chips */}
+          {attachments.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 px-3 pt-2.5 pb-1">
+              {attachments.map((att) => (
+                <div
+                  key={att.id}
+                  className="inline-flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs group/chip"
+                  style={{
+                    background: att.truncated ? "hsl(38 92% 50% / 0.1)" : "hsl(207 90% 45% / 0.1)",
+                    border: `1px solid ${att.truncated ? "hsl(38 92% 50% / 0.25)" : "hsl(207 90% 45% / 0.2)"}`,
+                    color: att.truncated ? "hsl(38 92% 65%)" : "hsl(207 90% 70%)",
+                  }}
+                >
+                  <span style={{ flexShrink: 0 }}>
+                    {att.type === "folder" ? <FolderOpen size={10} /> : <FileCode2 size={10} />}
+                  </span>
+                  <span className="font-mono truncate" style={{ maxWidth: 140, fontSize: "0.68rem" }}>
+                    {att.id}
+                  </span>
+                  <span
+                    className="tabular-nums"
+                    style={{ color: "hsl(220 14% 45%)", fontSize: "0.6rem", flexShrink: 0 }}
+                  >
+                    {att.lineCount}L
+                  </span>
+                  {att.truncated && (
+                    <span title={`Truncated from ${att.lineCount} lines to ${MAX_ATTACH_LINES} lines`} style={{ flexShrink: 0 }}>
+                      <AlertTriangle size={9} />
+                    </span>
+                  )}
+                  <button
+                    className="flex-shrink-0 rounded-sm transition-colors opacity-50 group-hover/chip:opacity-100"
+                    style={{ color: "hsl(220 14% 55%)" }}
+                    onMouseEnter={(e) => { e.currentTarget.style.color = "hsl(0 84% 65%)"; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.color = "hsl(220 14% 55%)"; }}
+                    onClick={() => removeAttachment(att.id)}
+                    title="Remove attachment"
+                  >
+                    <X size={10} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
           <textarea
             ref={textareaRef}
             className="w-full px-3.5 pt-3 pb-1 text-sm resize-none outline-none bg-transparent leading-relaxed"
@@ -580,11 +949,12 @@ export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, p
               minHeight: "42px",
               maxHeight: "160px",
               caretColor: "hsl(207 90% 60%)",
+              paddingTop: attachments.length > 0 ? "8px" : undefined,
             }}
             placeholder={
               mode === "agent"
-                ? "Describe what to build, or type / for commands..."
-                : "Ask anything..."
+                ? "Describe what to build, type / for commands, @ to attach files..."
+                : "Ask anything, type @ to attach files..."
             }
             value={input}
             onChange={handleInputChange}
@@ -597,19 +967,44 @@ export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, p
           <div className="flex items-center justify-between px-3 pb-2.5 pt-0.5">
             <div className="flex items-center gap-3">
               <button
-                className="rounded-lg p-1.5 transition-all duration-150"
-                style={{ color: "hsl(220 14% 42%)" }}
+                className="relative rounded-lg p-1.5 transition-all duration-150"
+                style={{
+                  color: showAtMenu || attachments.length > 0 ? "hsl(207 90% 60%)" : "hsl(220 14% 42%)",
+                  background: showAtMenu ? "hsl(207 90% 40% / 0.15)" : "transparent",
+                }}
                 onMouseEnter={(e) => {
-                  e.currentTarget.style.color = "hsl(220 14% 70%)";
+                  e.currentTarget.style.color = "hsl(207 90% 70%)";
                   e.currentTarget.style.background = "hsl(220 13% 24%)";
                 }}
                 onMouseLeave={(e) => {
-                  e.currentTarget.style.color = "hsl(220 14% 42%)";
-                  e.currentTarget.style.background = "transparent";
+                  e.currentTarget.style.color = showAtMenu || attachments.length > 0 ? "hsl(207 90% 60%)" : "hsl(220 14% 42%)";
+                  e.currentTarget.style.background = showAtMenu ? "hsl(207 90% 40% / 0.15)" : "transparent";
                 }}
-                title="Attach file context"
+                onClick={() => {
+                  if (showAtMenu) {
+                    setShowAtMenu(false);
+                  } else {
+                    setShowAtMenu(true);
+                    setAtFilter("");
+                    setAtIndex(0);
+                    setAtCursorStart(input.length);
+                  }
+                }}
+                title="Attach file context (@)"
               >
                 <Paperclip size={13} />
+                {attachments.length > 0 && (
+                  <span
+                    className="absolute -top-0.5 -right-0.5 w-3.5 h-3.5 rounded-full flex items-center justify-center text-white font-bold"
+                    style={{
+                      fontSize: "0.5rem",
+                      background: "hsl(207 90% 50%)",
+                      boxShadow: "0 1px 3px hsl(207 90% 30% / 0.5)",
+                    }}
+                  >
+                    {attachments.length}
+                  </span>
+                )}
               </button>
 
               {isStreaming ? (
@@ -659,29 +1054,29 @@ export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, p
                 <button
                   className="rounded-lg px-3 py-1.5 text-xs flex items-center gap-1.5 font-medium transition-all duration-200 disabled:opacity-30 disabled:cursor-not-allowed"
                   style={{
-                    background: input.trim()
+                    background: (input.trim() || attachments.length > 0)
                       ? "linear-gradient(135deg, hsl(207 90% 45%) 0%, hsl(207 90% 38%) 100%)"
                       : "hsl(220 13% 24%)",
-                    color: input.trim() ? "white" : "hsl(220 14% 45%)",
-                    boxShadow: input.trim()
+                    color: (input.trim() || attachments.length > 0) ? "white" : "hsl(220 14% 45%)",
+                    boxShadow: (input.trim() || attachments.length > 0)
                       ? "0 2px 8px hsl(207 90% 35% / 0.4), inset 0 1px 0 hsl(207 90% 65% / 0.15)"
                       : "none",
                     border: "none",
                   }}
                   onMouseEnter={(e) => {
-                    if (input.trim()) {
+                    if (input.trim() || attachments.length > 0) {
                       e.currentTarget.style.transform = "translateY(-1px)";
                       e.currentTarget.style.boxShadow = "0 4px 12px hsl(207 90% 35% / 0.5), inset 0 1px 0 hsl(207 90% 65% / 0.2)";
                     }
                   }}
                   onMouseLeave={(e) => {
                     e.currentTarget.style.transform = "translateY(0)";
-                    if (input.trim()) {
+                    if (input.trim() || attachments.length > 0) {
                       e.currentTarget.style.boxShadow = "0 2px 8px hsl(207 90% 35% / 0.4), inset 0 1px 0 hsl(207 90% 65% / 0.15)";
                     }
                   }}
                   onClick={handleSend}
-                  disabled={!input.trim() || isStreaming}
+                  disabled={(!input.trim() && attachments.length === 0) || isStreaming}
                   data-testid="chat-send-btn"
                 >
                   <Send size={11} />
