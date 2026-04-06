@@ -2714,12 +2714,35 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             fetchRes = null; // mark as failed so we try next
           }
           if (!fetchRes) {
-            log.error(`All vision models failed`);
-            res.write(sseChunk(id, model, { content: "Error: All vision models are currently unavailable. Please try again in a moment." }));
-            res.write(sseChunk(id, model, {}, "stop"));
-            res.write("data: [DONE]\n\n");
-            res.end();
-            return;
+            // All vision models failed — strip images and retry with default model
+            // This lets the agent loop continue instead of dying
+            log.warn(`All vision models failed — stripping images and retrying with ${KILO_DEFAULT_MODEL}`);
+            const strippedMessages = kiloMessages.map((m: any) => {
+              if (Array.isArray(m.content)) {
+                const textParts = m.content
+                  .filter((c: any) => c.type === "text")
+                  .map((c: any) => c.text);
+                return { ...m, content: textParts.join("\n") + "\n[Note: Screenshot image was captured but could not be sent to a vision model. All vision models are rate-limited. The text analysis of the UI is included above instead.]" };
+              }
+              return m;
+            });
+            fetchRes = await fetch(KILO_GATEWAY_URL, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${KILO_API_KEY}`,
+              },
+              body: JSON.stringify({
+                model: KILO_DEFAULT_MODEL,
+                messages: strippedMessages,
+                max_tokens: maxTokens,
+                temperature,
+                stream: true,
+                tools: allTools,
+                tool_choice: body.tool_choice || "auto",
+              }),
+            });
+            log.info(`Fallback to ${KILO_DEFAULT_MODEL} after vision failure: ${fetchRes.status}`);
           }
         } else {
           fetchRes = await fetch(KILO_GATEWAY_URL, {

@@ -158,10 +158,14 @@ export function useFileSystem() {
         case "get_project_tree":
           result = await fileOps.getProjectTree(args.path as string | undefined, activeProjectId);
           break;
-        case "screenshot_preview":
-          // Returns a base64 data URL — the chat hook handles vision format
-          result = await capturePreviewScreenshot(activeProjectId);
+        case "screenshot_preview": {
+          // Returns both a base64 image (for UI display) and a text layout analysis (for the AI)
+          const screenshot = await capturePreviewScreenshot(activeProjectId);
+          // Prefix the data URL so the chat hook can detect it for vision API + UI display
+          // The layout report is the main content the AI always receives (works without vision API)
+          result = screenshot.dataUrl + "\n\n" + screenshot.layoutReport;
           break;
+        }
         default:
           throw new Error(`Unknown tool: ${name}`);
       }

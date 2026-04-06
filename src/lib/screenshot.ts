@@ -20,9 +20,9 @@ const RENDER_TIMEOUT = 3000; // ms to wait for JS to run
 
 /**
  * Capture a screenshot of the current project's web preview.
- * Returns a base64 PNG data URL string.
+ * Returns a base64 PNG data URL string + a text layout analysis.
  */
-export async function capturePreviewScreenshot(projectId?: string): Promise<string> {
+export async function capturePreviewScreenshot(projectId?: string): Promise<{ dataUrl: string; layoutReport: string }> {
   // 1. Get all project files from IndexedDB
   let files = await db.files.where("type").equals("file").toArray();
   if (projectId) {
@@ -186,34 +186,201 @@ export async function capturePreviewScreenshot(projectId?: string): Promise<stri
       ctx.fillText(`Error: ${canvasErr instanceof Error ? canvasErr.message : "Unknown"}`, 40, CAPTURE_HEIGHT / 2 + 24);
     }
 
-    // 6. Convert to base64 PNG
+    // 6. Analyze the DOM for a text-based layout report (works without vision API!)
+    const layoutReport = analyzeDom(iframeDoc.body);
+
+    // 7. Convert to base64 PNG
     const dataUrl = canvas.toDataURL("image/png", 0.85);
-    return dataUrl;
+    return { dataUrl, layoutReport };
   } finally {
     // Clean up the hidden iframe
     document.body.removeChild(iframe);
   }
 }
 
-/**
- * Capture and return a smaller summary for the tool result.
- */
-export async function screenshotForTool(projectId?: string): Promise<{
-  dataUrl: string;
-  width: number;
-  height: number;
-  sizeKB: number;
-}> {
-  const dataUrl = await capturePreviewScreenshot(projectId);
-  const base64Length = dataUrl.length - "data:image/png;base64,".length;
-  const sizeKB = Math.round((base64Length * 3) / 4 / 1024);
+/* ─── DOM Layout Analyzer ────────────────────────────────────────────
+ * Walks the rendered DOM and extracts visual information as structured
+ * text. This gives the AI "eyes" without needing a vision API.
+ * Captures: element positions, sizes, colors, fonts, text content,
+ * images, links, overall layout structure.
+ * ──────────────────────────────────────────────────────────────────── */
 
-  return {
-    dataUrl,
-    width: CAPTURE_WIDTH,
-    height: CAPTURE_HEIGHT,
-    sizeKB,
+interface ElementInfo {
+  tag: string;
+  role?: string;
+  text?: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  bg?: string;
+  color?: string;
+  fontSize?: string;
+  fontFamily?: string;
+  fontWeight?: string;
+  src?: string;
+  href?: string;
+  display?: string;
+  children: ElementInfo[];
+}
+
+function isVisible(el: Element, style: CSSStyleDeclaration): boolean {
+  if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+  const rect = el.getBoundingClientRect();
+  if (rect.width === 0 && rect.height === 0) return false;
+  return true;
+}
+
+function rgbToHex(rgb: string): string {
+  const match = rgb.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+  if (!match) return rgb;
+  const r = parseInt(match[1]), g = parseInt(match[2]), b = parseInt(match[3]);
+  return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`;
+}
+
+function analyzeElement(el: Element, depth: number): ElementInfo | null {
+  if (depth > 8) return null; // don't go too deep
+  if (el.tagName === "SCRIPT" || el.tagName === "STYLE" || el.tagName === "LINK" || el.tagName === "META") return null;
+
+  const style = window.getComputedStyle(el);
+  if (!isVisible(el, style)) return null;
+
+  const rect = el.getBoundingClientRect();
+  const info: ElementInfo = {
+    tag: el.tagName.toLowerCase(),
+    x: Math.round(rect.x),
+    y: Math.round(rect.y),
+    w: Math.round(rect.width),
+    h: Math.round(rect.height),
+    children: [],
   };
+
+  // Role/landmark
+  const role = el.getAttribute("role");
+  if (role) info.role = role;
+
+  // Colors
+  const bg = rgbToHex(style.backgroundColor);
+  if (bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "#000000" && bg !== "transparent") info.bg = bg;
+  const color = rgbToHex(style.color);
+  if (color) info.color = color;
+
+  // Typography
+  info.fontSize = style.fontSize;
+  if (style.fontWeight !== "400" && style.fontWeight !== "normal") info.fontWeight = style.fontWeight;
+  // Only include font family for headings and important elements
+  if (["h1", "h2", "h3", "h4", "h5", "h6", "button", "a"].includes(info.tag)) {
+    info.fontFamily = style.fontFamily.split(",")[0].trim().replace(/['"]/g, "");
+  }
+
+  // Display mode
+  if (["flex", "grid", "inline-flex", "inline-grid"].includes(style.display)) {
+    info.display = style.display;
+  }
+
+  // Direct text content (not from children)
+  const directText = Array.from(el.childNodes)
+    .filter((n) => n.nodeType === 3) // text nodes
+    .map((n) => n.textContent?.trim())
+    .filter(Boolean)
+    .join(" ");
+  if (directText && directText.length > 0) {
+    info.text = directText.slice(0, 100) + (directText.length > 100 ? "..." : "");
+  }
+
+  // Image source
+  if (el.tagName === "IMG") {
+    const src = (el as HTMLImageElement).src;
+    info.src = src.length > 100 ? src.slice(0, 80) + "..." : src;
+  }
+
+  // Link href
+  if (el.tagName === "A") {
+    info.href = (el as HTMLAnchorElement).getAttribute("href") || undefined;
+  }
+
+  // Recurse into children
+  for (const child of Array.from(el.children)) {
+    const childInfo = analyzeElement(child, depth + 1);
+    if (childInfo) info.children.push(childInfo);
+  }
+
+  return info;
+}
+
+function formatLayoutTree(info: ElementInfo, indent: number = 0): string {
+  const pad = "  ".repeat(indent);
+  const parts: string[] = [];
+
+  // Build element description
+  let desc = `${pad}<${info.tag}`;
+  if (info.role) desc += ` role="${info.role}"`;
+  if (info.display) desc += ` display=${info.display}`;
+  desc += `> [${info.x},${info.y} ${info.w}x${info.h}]`;
+  if (info.bg) desc += ` bg:${info.bg}`;
+  if (info.color) desc += ` color:${info.color}`;
+  if (info.fontSize) desc += ` ${info.fontSize}`;
+  if (info.fontWeight) desc += ` bold:${info.fontWeight}`;
+  if (info.fontFamily) desc += ` font:${info.fontFamily}`;
+  if (info.src) desc += ` src="${info.src}"`;
+  if (info.href) desc += ` href="${info.href}"`;
+  if (info.text) desc += ` "${info.text}"`;
+
+  parts.push(desc);
+
+  // Children
+  for (const child of info.children) {
+    parts.push(formatLayoutTree(child, indent + 1));
+  }
+
+  return parts.join("\n");
+}
+
+function analyzeDom(body: HTMLElement): string {
+  const rootInfo = analyzeElement(body, 0);
+  if (!rootInfo) return "Could not analyze DOM — page may be empty.";
+
+  const lines: string[] = [];
+  lines.push("=== UI LAYOUT ANALYSIS ===");
+  lines.push(`Viewport: ${CAPTURE_WIDTH}x${CAPTURE_HEIGHT}`);
+  lines.push("");
+
+  // Gather high-level stats
+  const allElements: ElementInfo[] = [];
+  function collect(info: ElementInfo) {
+    allElements.push(info);
+    info.children.forEach(collect);
+  }
+  collect(rootInfo);
+
+  const images = allElements.filter((e) => e.tag === "img");
+  const links = allElements.filter((e) => e.tag === "a");
+  const headings = allElements.filter((e) => /^h[1-6]$/.test(e.tag));
+  const buttons = allElements.filter((e) => e.tag === "button" || (e.tag === "a" && e.role === "button"));
+  const navs = allElements.filter((e) => e.tag === "nav" || e.role === "navigation");
+  const uniqueBgColors = [...new Set(allElements.filter((e) => e.bg).map((e) => e.bg))];
+  const uniqueTextColors = [...new Set(allElements.filter((e) => e.color).map((e) => e.color))];
+
+  lines.push("--- SUMMARY ---");
+  lines.push(`Total visible elements: ${allElements.length}`);
+  lines.push(`Images: ${images.length}${images.length > 0 ? " — " + images.map((i) => i.src || "no-src").join(", ") : ""}`);
+  lines.push(`Links: ${links.length}${links.length > 0 ? " — " + links.slice(0, 5).map((l) => `"${l.text || ""}" → ${l.href || ""}`).join(", ") : ""}`);
+  lines.push(`Headings: ${headings.map((h) => `${h.tag}:"${h.text || ""}"`).join(", ") || "none"}`);
+  lines.push(`Buttons: ${buttons.map((b) => `"${b.text || ""}"`).join(", ") || "none"}`);
+  lines.push(`Nav sections: ${navs.length}`);
+  lines.push(`Background colors used: ${uniqueBgColors.join(", ") || "none"}`);
+  lines.push(`Text colors used: ${uniqueTextColors.slice(0, 8).join(", ") || "none"}`);
+  lines.push("");
+
+  lines.push("--- LAYOUT TREE ---");
+  lines.push(formatLayoutTree(rootInfo));
+
+  // Cap at ~4000 chars to avoid overwhelming the context
+  const report = lines.join("\n");
+  if (report.length > 4000) {
+    return report.slice(0, 3900) + "\n\n[Layout analysis truncated — showing first 3900 chars]";
+  }
+  return report;
 }
 
 function escapeRegex(s: string): string {
