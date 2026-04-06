@@ -26,7 +26,7 @@ import {
 import { useChat, ChatMode, ToolExecutor, WorkspaceContext, CheckpointManager } from "@/hooks/useChat";
 import { ChatMessageItem } from "./ChatMessage";
 import { FileNode } from "@/hooks/useFileSystem";
-import { At, FolderOpen, FileCode2, AlertTriangle } from "lucide-react";
+import { AtSign, FolderOpen, FileCode2, AlertTriangle } from "lucide-react";
 
 /* ─── @ File Attachment System ───────────────────────────────────────── */
 const MAX_ATTACH_LINES = 500;
@@ -786,7 +786,7 @@ export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, p
             className="px-3 py-1.5 text-xs font-medium flex items-center gap-1.5"
             style={{ color: "hsl(220 14% 42%)", borderBottom: "1px solid hsl(220 13% 22%)" }}
           >
-            <At size={10} />
+            <AtSign size={10} />
             <span>Attach file or folder</span>
             {atFilter && (
               <span className="ml-auto font-mono" style={{ color: "hsl(207 90% 60%)", fontSize: "0.65rem" }}>
