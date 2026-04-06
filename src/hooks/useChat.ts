@@ -975,46 +975,20 @@ export function useChat(
             );
           }
 
-          // Tool result must be a string (OpenAI format requirement).
           // For screenshots: result contains "dataUrl\n\nlayoutReport"
-          // - The layout report (text) ALWAYS goes to the AI as the tool result (no vision API needed!)
-          // - The image optionally goes as a user vision message (if vision API works, bonus)
+          // Strip the image data URL — only send the text layout report to the AI
+          // (the image is shown in the chat UI but NOT sent to the API)
+          let apiToolResult = toolResult;
           if (tc.name === "screenshot_preview" && toolResult.startsWith("data:image/")) {
-            // Split: first line is the data URL, rest is the layout analysis
             const splitIdx = toolResult.indexOf("\n\n");
-            const screenshotDataUrl = splitIdx > 0 ? toolResult.slice(0, splitIdx) : toolResult;
-            const layoutReport = splitIdx > 0 ? toolResult.slice(splitIdx + 2) : "Screenshot captured.";
-
-            // Send the TEXT layout analysis as the tool result (always works, no vision needed!)
-            apiMessages.push({
-              role: "tool",
-              tool_call_id: tc.id,
-              content: layoutReport,
-            });
-            // Also inject the image as a user vision message (vision API will try, falls back gracefully)
-            apiMessages.push({
-              role: "user",
-              content: [
-                {
-                  type: "text",
-                  text: "[System: Screenshot of the current web preview is attached. The text layout analysis above describes the visual structure. If you can see the image, use it for additional visual verification.]",
-                },
-                {
-                  type: "image_url",
-                  image_url: {
-                    url: screenshotDataUrl,
-                    detail: "low",
-                  },
-                },
-              ],
-            });
-          } else {
-            apiMessages.push({
-              role: "tool",
-              tool_call_id: tc.id,
-              content: toolResult,
-            });
+            apiToolResult = splitIdx > 0 ? toolResult.slice(splitIdx + 2) : "Screenshot captured.";
           }
+
+          apiMessages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: apiToolResult,
+          });
         }
 
         continue;

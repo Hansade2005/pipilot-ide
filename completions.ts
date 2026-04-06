@@ -4,7 +4,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 interface OpenAIMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | null | Array<{ type: string; text?: string; image_url?: { url: string; detail?: string } }>;
+  content: string | null;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
   name?: string;
@@ -2654,25 +2654,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const allTools = [...TASK_AGENT_TOOLS, ...(body.tools || [])];
       const customToolNames = new Set((body.tools || []).map((t: any) => (t.function || t).name));
 
-      // Detect if any message contains image content (vision request)
-      const hasImageContent = body.messages.some((m: any) => {
-        if (Array.isArray(m.content)) {
-          return m.content.some((c: any) => c.type === "image_url");
-        }
-        return false;
-      });
-      // Free vision-capable models (fallback chain — try each until one works)
-      // kilo-auto/free auto-routes to dead minimax for images, so we force specific models
-      const VISION_MODELS = [
-        "bytedance-seed/dola-seed-2.0-pro:free",
-        "qwen/qwen3.6-plus:free",
-        "openrouter/free",
-      ];
-      let kiloModel = hasImageContent ? VISION_MODELS[0] : KILO_DEFAULT_MODEL;
-      if (hasImageContent) {
-        log.info(`Vision content detected — using model: ${kiloModel}`);
-      }
-
       // Send initial role chunk
       res.write(sseChunk(id, model, { role: "assistant", content: "" }));
 
@@ -2683,90 +2664,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       for (let step = 0; step < kiloMaxSteps; step++) {
         log.info(`Direct Kilo step ${step + 1}/${kiloMaxSteps}`);
 
-        // For vision requests, try each model in the fallback chain
-        let fetchRes: Response | null = null;
-        if (hasImageContent) {
-          for (let vi = 0; vi < VISION_MODELS.length; vi++) {
-            kiloModel = VISION_MODELS[vi];
-            log.info(`Trying vision model: ${kiloModel}`);
-            fetchRes = await fetch(KILO_GATEWAY_URL, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${KILO_API_KEY}`,
-              },
-              body: JSON.stringify({
-                model: kiloModel,
-                messages: kiloMessages,
-                max_tokens: maxTokens,
-                temperature,
-                stream: true,
-                tools: allTools,
-                tool_choice: body.tool_choice || "auto",
-              }),
-            });
-            if (fetchRes.ok) {
-              log.info(`Vision model ${kiloModel} succeeded`);
-              break;
-            }
-            const errText = await fetchRes.text();
-            log.warn(`Vision model ${kiloModel} failed (${fetchRes.status}): ${errText.slice(0, 200)}`);
-            fetchRes = null; // mark as failed so we try next
-          }
-          if (!fetchRes) {
-            // All vision models failed — strip images and retry with default model
-            // This lets the agent loop continue instead of dying
-            log.warn(`All vision models failed — stripping images and retrying with ${KILO_DEFAULT_MODEL}`);
-            const strippedMessages = kiloMessages.map((m: any) => {
-              if (Array.isArray(m.content)) {
-                const textParts = m.content
-                  .filter((c: any) => c.type === "text")
-                  .map((c: any) => c.text);
-                return { ...m, content: textParts.join("\n") + "\n[Note: An image was attached but could not be processed — all vision models are currently rate-limited. Please analyze based on the text content provided.]" };
-              }
-              return m;
-            });
-            fetchRes = await fetch(KILO_GATEWAY_URL, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${KILO_API_KEY}`,
-              },
-              body: JSON.stringify({
-                model: KILO_DEFAULT_MODEL,
-                messages: strippedMessages,
-                max_tokens: maxTokens,
-                temperature,
-                stream: true,
-                tools: allTools,
-                tool_choice: body.tool_choice || "auto",
-              }),
-            });
-            log.info(`Fallback to ${KILO_DEFAULT_MODEL} after vision failure: ${fetchRes.status}`);
-          }
-        } else {
-          fetchRes = await fetch(KILO_GATEWAY_URL, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${KILO_API_KEY}`,
-            },
-            body: JSON.stringify({
-              model: kiloModel,
-              messages: kiloMessages,
-              max_tokens: maxTokens,
-              temperature,
-              stream: true,
-              tools: allTools,
-              tool_choice: body.tool_choice || "auto",
-            }),
-          });
-        }
+        const fetchRes = await fetch(KILO_GATEWAY_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${KILO_API_KEY}`,
+          },
+          body: JSON.stringify({
+            model: KILO_DEFAULT_MODEL,
+            messages: kiloMessages,
+            max_tokens: maxTokens,
+            temperature,
+            stream: true,
+            tools: allTools,
+            tool_choice: body.tool_choice || "auto",
+          }),
+        });
 
-        if (!fetchRes!.ok) {
-          const errText = await fetchRes!.text();
-          log.error(`Direct Kilo error ${fetchRes!.status}: ${errText.slice(0, 500)}`);
-          res.write(sseChunk(id, model, { content: `Error: ${fetchRes!.status}` }));
+        if (!fetchRes.ok) {
+          const errText = await fetchRes.text();
+          log.error(`Direct Kilo error ${fetchRes.status}: ${errText.slice(0, 500)}`);
+          res.write(sseChunk(id, model, { content: `Error: ${fetchRes.status}` }));
           res.write(sseChunk(id, model, {}, "stop"));
           res.write("data: [DONE]\n\n");
           res.end();
@@ -2774,7 +2692,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
 
         // Read Kilo stream, collect content + tool_calls
-        const reader = fetchRes!.body!.getReader();
+        const reader = fetchRes.body!.getReader();
         const decoder = new TextDecoder();
         let collected = "";
         const streamToolCalls: any[] = [];
