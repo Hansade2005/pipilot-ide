@@ -146,35 +146,6 @@ export const availableTools: Tool[] = [
     icon: 'Camera',
     category: 'dev',
   },
-  // ── Browser Interaction ──
-  {
-    id: 'preview_click',
-    name: 'Click Element',
-    description: 'Click an element in the preview by selector or coordinates',
-    icon: 'MousePointer',
-    category: 'dev',
-  },
-  {
-    id: 'preview_scroll',
-    name: 'Scroll Preview',
-    description: 'Scroll the preview page up, down, left, or right',
-    icon: 'ArrowDownUp',
-    category: 'dev',
-  },
-  {
-    id: 'preview_type',
-    name: 'Type Text',
-    description: 'Type text into an input or textarea in the preview',
-    icon: 'Keyboard',
-    category: 'dev',
-  },
-  {
-    id: 'preview_find_elements',
-    name: 'Find Elements',
-    description: 'Find all interactive elements (buttons, links, inputs) in the preview',
-    icon: 'ScanSearch',
-    category: 'dev',
-  },
   // ── Execution ──
   {
     id: 'run_script',

@@ -1,21 +1,15 @@
-import { useMemo, useEffect, useRef } from "react";
+import { useMemo } from "react";
 import {
   SandpackProvider,
   SandpackPreview,
-  useSandpack,
 } from "@codesandbox/sandpack-react";
 import { FileNode } from "@/hooks/useFileSystem";
-import { CloudPreview } from "./CloudPreview";
 
 interface WebPreviewProps {
   files: FileNode[];
-  projectType?: "static" | "nodebox" | "cloud";
 }
 
-const WEB_EXTENSIONS = new Set([
-  ".html", ".htm", ".css", ".js", ".mjs", ".jsx",
-  ".svg", ".json", ".ts", ".tsx", ".md", ".xml", ".txt",
-]);
+const WEB_EXTENSIONS = new Set([".html", ".htm", ".css", ".js", ".mjs", ".jsx", ".svg", ".json", ".ts", ".tsx", ".md", ".xml", ".txt"]);
 
 function getExt(name: string): string {
   const i = name.lastIndexOf(".");
@@ -23,80 +17,26 @@ function getExt(name: string): string {
 }
 
 /** Flatten file tree → { "/index.html": { code } } */
-function flattenToSandpack(nodes: FileNode[]): Record<string, string> {
-  const out: Record<string, string> = {};
+function flattenToSandpack(nodes: FileNode[]): Record<string, { code: string }> {
+  const out: Record<string, { code: string }> = {};
   for (const node of nodes) {
     if (node.type === "file" && node.content != null && WEB_EXTENSIONS.has(getExt(node.name))) {
       const key = node.id.startsWith("/") ? node.id : `/${node.id}`;
-      out[key] = node.content;
+      out[key] = { code: node.content };
     }
     if (node.children) Object.assign(out, flattenToSandpack(node.children));
   }
   return out;
 }
 
-/**
- * Inner component that syncs IndexedDB file changes to Sandpack
- * incrementally via updateFile/addFile/deleteFile — no full remount.
- */
-function FileSyncer({ files }: { files: FileNode[] }) {
-  const { sandpack } = useSandpack();
-  const prevFilesRef = useRef<Record<string, string>>({});
-
-  useEffect(() => {
-    const current = flattenToSandpack(files);
-    const prev = prevFilesRef.current;
-
-    // Find added or changed files
-    for (const [path, code] of Object.entries(current)) {
-      if (prev[path] !== code) {
-        // File is new or changed
-        sandpack.updateFile(path, code, false);
-      }
-    }
-
-    // Find deleted files
-    for (const path of Object.keys(prev)) {
-      if (!(path in current)) {
-        sandpack.deleteFile(path, false);
-      }
-    }
-
-    prevFilesRef.current = current;
-  }, [files, sandpack]);
-
-  return null;
-}
-
-export function WebPreview({ files, projectType = "static" }: WebPreviewProps) {
-  if (projectType === "cloud") {
-    return <CloudPreview files={files} />;
-  }
-
-  const isNode = projectType === "nodebox";
-
-  // Initial files — only used on first mount. Updates go through FileSyncer.
-  const initialFiles = useMemo(() => {
+export function WebPreview({ files }: WebPreviewProps) {
+  const spFiles = useMemo(() => {
     const flat = flattenToSandpack(files);
-    const spFiles: Record<string, { code: string }> = {};
 
-    for (const [path, code] of Object.entries(flat)) {
-      spFiles[path] = { code };
-    }
-
-    if (isNode) {
-      if (!spFiles["/package.json"]) {
-        spFiles["/package.json"] = {
-          code: JSON.stringify({ name: "project", version: "1.0.0", dependencies: {} }, null, 2),
-        };
-      }
-      if (!spFiles["/index.js"] && !spFiles["/server.js"] && !spFiles["/app.js"]) {
-        spFiles["/index.js"] = { code: `console.log("Hello from Node.js!");\n` };
-      }
-    } else {
-      if (!spFiles["/index.html"]) {
-        spFiles["/index.html"] = {
-          code: `<!DOCTYPE html>
+    // Ensure /index.html exists
+    if (!flat["/index.html"]) {
+      flat["/index.html"] = {
+        code: `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -110,22 +50,19 @@ export function WebPreview({ files, projectType = "static" }: WebPreviewProps) {
   <script src="/script.js"></script>
 </body>
 </html>`,
-        };
-      }
+      };
     }
 
-    return spFiles;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isNode]); // Only recompute on project type change, not on every file edit
+    return flat;
+  }, [files]);
 
   return (
     <SandpackProvider
-      template={isNode ? "node" : "static"}
-      files={initialFiles}
+      template="static"
+      files={spFiles}
       theme="dark"
       style={{ height: "100%", display: "flex", flexDirection: "column" }}
     >
-      <FileSyncer files={files} />
       <SandpackPreview
         showNavigator
         showRefreshButton
