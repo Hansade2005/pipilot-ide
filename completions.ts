@@ -2649,7 +2649,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       res.setHeader("Connection", "keep-alive");
 
       const id = `chatcmpl-${Math.random().toString(36).substring(2, 10)}`;
-      const directKiloStartTime = Date.now();
 
       // Merge built-in tools (web_search, web_extract, image_generation) with user's custom tools
       const allTools = [...TASK_AGENT_TOOLS, ...(body.tools || [])];
@@ -2663,18 +2662,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const kiloMaxSteps = Math.min(body.max_steps ?? 25, MAX_STEPS_LIMIT);
 
       for (let step = 0; step < kiloMaxSteps; step++) {
-        // Check if we're approaching the Vercel timeout
-        const elapsed = Date.now() - directKiloStartTime;
-        if (elapsed >= CONTINUATION_THRESHOLD_MS) {
-          log.warn(`Direct Kilo approaching Vercel timeout (${Math.round(elapsed / 1000)}s) — ending stream gracefully`);
-          res.write(sseChunk(id, model, { content: "\n\n[Response interrupted — server timeout. Please continue the conversation.]" }));
-          res.write(sseChunk(id, model, {}, "stop"));
-          res.write("data: [DONE]\n\n");
-          res.end();
-          return;
-        }
-
-        log.info(`Direct Kilo step ${step + 1}/${kiloMaxSteps} (${Math.round(elapsed / 1000)}s elapsed)`);
+        log.info(`Direct Kilo step ${step + 1}/${kiloMaxSteps}`);
 
         const fetchRes = await fetch(KILO_GATEWAY_URL, {
           method: "POST",
@@ -2712,13 +2700,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         let buffer = "";
 
         while (true) {
-          // Check Vercel timeout during stream reading
-          if (Date.now() - directKiloStartTime >= CONTINUATION_THRESHOLD_MS) {
-            log.warn("Approaching Vercel timeout during Kilo stream read — breaking");
-            try { reader.cancel(); } catch {}
-            break;
-          }
-
           const { done, value } = await reader.read();
           if (done) break;
 
@@ -2817,16 +2798,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             res.write("data: [DONE]\n\n");
             res.end();
             log.info("Direct Kilo stream ended (tool_calls → client)");
-            return;
-          }
-
-          // Check timeout before continuing the loop
-          if (Date.now() - directKiloStartTime >= CONTINUATION_THRESHOLD_MS) {
-            log.warn("Approaching Vercel timeout after built-in tool execution — ending stream");
-            res.write(sseChunk(id, model, { content: "\n\n[Response interrupted — server timeout after tool execution. Please continue.]" }));
-            res.write(sseChunk(id, model, {}, "stop"));
-            res.write("data: [DONE]\n\n");
-            res.end();
             return;
           }
 
