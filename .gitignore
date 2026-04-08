@@ -10,6 +10,9 @@ coverage/
 build/
 dist/
 
+# Agent SDK workspaces (generated project files)
+.workspaces/
+
 # Environment variables
 .env
 .env.local

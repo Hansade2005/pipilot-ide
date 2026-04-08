@@ -1113,7 +1113,7 @@ export function useChat(
     const response = await fetch("/api/agent", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, systemPrompt }),
+      body: JSON.stringify({ prompt, systemPrompt, projectId: projectIdRef.current }),
       signal: controller.signal,
     });
 
