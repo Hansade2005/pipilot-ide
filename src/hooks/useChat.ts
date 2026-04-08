@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { db } from "@/lib/db";
 
-export type ChatMode = "chat" | "agent";
+export type ChatMode = "chat" | "agent" | "agent-sdk";
 
 export interface ToolCallInfo {
   id: string;
@@ -576,6 +576,91 @@ async function consumeStream(
   };
 }
 
+// ─── Agent SDK Stream Consumer ──────────────────────────────────────────────
+
+interface AgentSdkStreamResult {
+  text: string;
+  toolCalls: { id: string; name: string; result?: string; status: "done" | "running" | "error" }[];
+  cost: number | null;
+  error: string | null;
+}
+
+async function consumeAgentSdkStream(
+  response: Response,
+  onText: (text: string) => void,
+  onToolUse: (name: string, id: string) => void,
+  onToolResult: (toolUseId: string, result: string) => void,
+  signal: AbortSignal
+): Promise<AgentSdkStreamResult> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("No response body");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullText = "";
+  const toolCalls: AgentSdkStreamResult["toolCalls"] = [];
+  let cost: number | null = null;
+  let error: string | null = null;
+
+  while (true) {
+    if (signal.aborted) break;
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+
+      try {
+        const event = JSON.parse(line.slice(6));
+
+        switch (event.type) {
+          case "text":
+            if (event.data) {
+              fullText += event.data;
+              onText(event.data);
+            }
+            break;
+
+          case "tool_use":
+            if (event.name) {
+              const id = event.id || generateId();
+              toolCalls.push({ id, name: event.name, status: "running" });
+              onToolUse(event.name, id);
+            }
+            break;
+
+          case "tool_result":
+            if (event.tool_use_id) {
+              const tc = toolCalls.find((t) => t.id === event.tool_use_id);
+              if (tc) {
+                tc.result = event.result;
+                tc.status = "done";
+              }
+              onToolResult(event.tool_use_id, event.result || "");
+            }
+            break;
+
+          case "result":
+            if (event.cost != null) cost = event.cost;
+            break;
+
+          case "error":
+            error = event.message || "Agent SDK error";
+            break;
+        }
+      } catch {
+        // skip malformed SSE
+      }
+    }
+  }
+
+  return { text: fullText, toolCalls, cost, error };
+}
+
 // ─── Checkpoint Manager Interface ────────────────────────────────────────────
 
 export interface CheckpointManager {
@@ -689,22 +774,27 @@ export function useChat(
           }
         }
 
-        // Build conversation history
-        const allMessages = [...messagesRef.current, userMsg];
-        const conversationMessages = allMessages
-          .filter((m) => m.role === "user" || m.role === "assistant" || m.role === "tool")
-          .map((m) => {
-            const msg: Record<string, unknown> = { role: m.role, content: m.content };
-            if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
-            return msg;
-          });
+        if (mode === "agent-sdk") {
+          // Agent SDK mode: call the backend Agent SDK endpoint
+          await runAgentSdkLoop(userContent, controller);
+        } else {
+          // OpenAI-compatible mode: call chat/completions directly
+          const allMessages = [...messagesRef.current, userMsg];
+          const conversationMessages = allMessages
+            .filter((m) => m.role === "user" || m.role === "assistant" || m.role === "tool")
+            .map((m) => {
+              const msg: Record<string, unknown> = { role: m.role, content: m.content };
+              if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+              return msg;
+            });
 
-        const apiMessages: Record<string, unknown>[] = [
-          { role: "system", content: buildSystemPrompt(contextRef.current) },
-          ...conversationMessages,
-        ];
+          const apiMessages: Record<string, unknown>[] = [
+            { role: "system", content: buildSystemPrompt(contextRef.current) },
+            ...conversationMessages,
+          ];
 
-        await runChatLoop(apiMessages, controller);
+          await runChatLoop(apiMessages, controller);
+        }
 
         // After the chat loop completes, create a checkpoint tied to this user message
         if (checkpointManagerRef.current) {
@@ -996,6 +1086,105 @@ export function useChat(
 
       // No tool calls — we're done
       break;
+    }
+  }
+
+  // ─── Agent SDK Loop ─────────────────────────────────────────────────────────
+  async function runAgentSdkLoop(
+    prompt: string,
+    controller: AbortController
+  ) {
+    const assistantId = generateId();
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+        streaming: true,
+        timestamp: new Date(),
+        toolCalls: [],
+        builtinToolStatuses: [],
+      },
+    ]);
+
+    const systemPrompt = buildSystemPrompt(contextRef.current);
+
+    const response = await fetch("/api/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt, systemPrompt }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Agent SDK error: ${response.status} ${response.statusText}`);
+    }
+
+    const result = await consumeAgentSdkStream(
+      response,
+      // onText
+      (text) => {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId ? { ...m, content: m.content + text } : m
+          )
+        );
+      },
+      // onToolUse
+      (name, id) => {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  toolCalls: [
+                    ...(m.toolCalls || []),
+                    { id, name, arguments: "{}", status: "running" as const },
+                  ],
+                }
+              : m
+          )
+        );
+      },
+      // onToolResult
+      (toolUseId, toolResult) => {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  toolCalls: m.toolCalls?.map((tc) =>
+                    tc.id === toolUseId
+                      ? { ...tc, result: toolResult, status: "done" as const }
+                      : tc
+                  ),
+                }
+              : m
+          )
+        );
+      },
+      controller.signal
+    );
+
+    // Finalize the message
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === assistantId ? { ...m, streaming: false } : m
+      )
+    );
+
+    if (result.error) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: generateId(),
+          role: "assistant",
+          content: `Agent SDK Error: ${result.error}`,
+          streaming: false,
+          timestamp: new Date(),
+        },
+      ]);
     }
   }
 

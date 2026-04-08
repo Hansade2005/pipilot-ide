@@ -500,6 +500,12 @@ export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, p
       desc: "Multi-step autonomous coding",
       color: "hsl(207 90% 65%)",
     },
+    "agent-sdk": {
+      label: "Agent SDK",
+      icon: <Bot size={12} />,
+      desc: "Anthropic Agent SDK (server-side)",
+      color: "hsl(142 71% 60%)",
+    },
   };
 
   const messageCount = messages.filter((m) => m.role === "user").length;
@@ -551,10 +557,12 @@ export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, p
               style={{
                 background: mode === "agent"
                   ? "linear-gradient(135deg, hsl(207 90% 36% / 0.25) 0%, hsl(207 90% 36% / 0.15) 100%)"
-                  : "hsl(220 13% 22%)",
+                  : mode === "agent-sdk"
+                    ? "linear-gradient(135deg, hsl(142 71% 36% / 0.25) 0%, hsl(142 71% 36% / 0.15) 100%)"
+                    : "hsl(220 13% 22%)",
                 color: modeConfig[mode].color,
-                border: `1px solid ${mode === "agent" ? "hsl(207 90% 45% / 0.3)" : "hsl(220 13% 28%)"}`,
-                boxShadow: mode === "agent" ? "0 0 12px hsl(207 90% 50% / 0.15)" : "none",
+                border: `1px solid ${mode === "agent" ? "hsl(207 90% 45% / 0.3)" : mode === "agent-sdk" ? "hsl(142 71% 45% / 0.3)" : "hsl(220 13% 28%)"}`,
+                boxShadow: mode === "agent" ? "0 0 12px hsl(207 90% 50% / 0.15)" : mode === "agent-sdk" ? "0 0 12px hsl(142 71% 50% / 0.15)" : "none",
               }}
               onClick={() => setShowModeMenu((p) => !p)}
               data-testid="chat-mode-toggle"
@@ -577,7 +585,7 @@ export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, p
                     boxShadow: "0 8px 32px hsl(220 13% 5% / 0.6), 0 0 0 1px hsl(220 13% 25%)",
                   }}
                 >
-                  {(["chat", "agent"] as ChatMode[]).map((m) => (
+                  {(["chat", "agent", "agent-sdk"] as ChatMode[]).map((m) => (
                     <button
                       key={m}
                       className="w-full flex items-start gap-2.5 px-3.5 py-2.5 text-xs transition-all duration-150 text-left"
@@ -651,6 +659,29 @@ export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, p
           />
           <span style={{ fontWeight: 500 }}>Agent mode</span>
           <span style={{ color: "hsl(220 14% 45%)" }}>— autonomous coding with file tools</span>
+        </div>
+      )}
+
+      {/* ── Agent SDK mode badge ── */}
+      {mode === "agent-sdk" && (
+        <div
+          className="flex items-center gap-2 px-4 py-2 text-xs"
+          style={{
+            background: "linear-gradient(90deg, hsl(142 71% 40% / 0.08) 0%, transparent 100%)",
+            borderBottom: "1px solid hsl(220 13% 20%)",
+            color: "hsl(142 71% 60%)",
+          }}
+        >
+          <div
+            className="w-1.5 h-1.5 rounded-full"
+            style={{
+              background: "hsl(142 71% 50%)",
+              boxShadow: "0 0 6px hsl(142 71% 50% / 0.5)",
+              animation: "pulse 2s infinite",
+            }}
+          />
+          <span style={{ fontWeight: 500 }}>Agent SDK</span>
+          <span style={{ color: "hsl(220 14% 45%)" }}>— Anthropic Messages API (server-side)</span>
         </div>
       )}
 
@@ -986,7 +1017,9 @@ export function ChatPanel({ toolExecutor, workspaceContext, checkpointManager, p
             placeholder={
               mode === "agent"
                 ? "Describe what to build, type / for commands, @ to attach files..."
-                : "Ask anything, type @ to attach files..."
+                : mode === "agent-sdk"
+                  ? "Describe what the Agent SDK should do..."
+                  : "Ask anything, type @ to attach files..."
             }
             value={input}
             onChange={handleInputChange}
